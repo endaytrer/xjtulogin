@@ -1,4 +1,4 @@
-module xjtuorg
+module github.com/endaytrer/xjtuorg
 
 go 1.23.4
 
