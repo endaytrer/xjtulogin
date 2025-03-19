@@ -24,7 +24,7 @@ type XjtuOrg struct {
 	crypter cipher.Block
 }
 
-func New(mobile bool) XjtuOrg {
+func new(mobile bool) XjtuOrg {
 	encrypter, err := aes.NewCipher([]byte("0725@pwdorgopenp"))
 	if err != nil {
 		panic("Crypto error")
@@ -137,7 +137,7 @@ func (t *XjtuOrg) request(req *http.Request, content_type ContentType) (*General
 	}
 	return &res_json, nil
 }
-func (t *XjtuOrg) Login(login_url, username, password string) (redir_url string, err error) {
+func (t *XjtuOrg) login(login_url, username, password string) (redir_url string, err error) {
 	encrypted_passwd := aesECBEncrypt(t.crypter, []byte(password))
 	encoded := base64.StdEncoding.EncodeToString(encrypted_passwd)
 
@@ -279,4 +279,9 @@ func (t *XjtuOrg) Login(login_url, username, password string) (redir_url string,
 		return "", err
 	}
 	return redir_url, nil
+}
+
+func Login(mobile bool, login_url, username, password string) (redir_url string, err error) {
+	session := new(mobile)
+	return session.login(login_url, username, password)
 }
