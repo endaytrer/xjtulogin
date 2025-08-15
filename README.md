@@ -1,7 +1,13 @@
-# XJTUORG
+# XJTULogin
 
 XJTU authentication module in Go
 
+### How login.xjtu.edu.cn Work
+
+1. Password encryption: RSA
+
+    Get public key from [https://login.xjtu.edu.cn/cas/jwt/publicKey](https://login.xjtu.edu.cn/cas/jwt/publicKey),
+    encrypt password with RSA
 ### Usage
 
 ```go
