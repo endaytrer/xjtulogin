@@ -5,19 +5,18 @@ import (
 	"testing"
 )
 
-func TestEncryptWithPublicKey(t *testing.T) {
-	pubkeyBytes, err := os.ReadFile("pubkey.pem")
+func TestLogin(t *testing.T) {
+	username, success := os.LookupEnv("XJTU_USERNAME")
+	if !success {
+		t.Fatal("XJTU_USERNAME not set")
+	}
+	password, success := os.LookupEnv("XJTU_PASSWORD")
+	if !success {
+		t.Fatal("XJTU_PASSWORD not set")
+	}
+	redir_url, err := Login("http://gmis.xjtu.edu.cn/pyxx/sso/login", username, password)
 	if err != nil {
-		t.Fatalf("failed to read pubkey.pem: %v", err)
+		t.Fatalf("Login failed: %v", err)
 	}
-	pubkey := string(pubkeyBytes)
-	message := []byte("1234567890abcdef")
-	ciphertext, err := encryptWithPublicKey(message, pubkey)
-	if err != nil {
-		t.Fatalf("encryption failed: %v", err)
-	}
-	if ciphertext == "" {
-		t.Fatal("ciphertext is empty")
-	}
-	t.Logf("Encrypted: %s", ciphertext)
+	t.Logf("Redirect URL: %s", redir_url)
 }

@@ -3,11 +3,9 @@ package xjtulogin
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -42,12 +40,9 @@ func encryptWithPublicKey(message []byte, publicKeyPEM string) (string, error) {
 		return "", fmt.Errorf("key is not a valid RSA public key")
 	}
 
-	// 4. Encrypt the message using RSA-OAEP.
-	// OAEP is the recommended padding scheme for new applications.
-	// - sha256.New() is the hash function.
-	// - rand.Reader is the source of randomness, ensuring each encryption is unique.
-	// - The final 'nil' is for an optional label.
-	ciphertext, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, rsaPubKey, message, nil)
+	// 4. Encrypt the message using RSA-PKCS1v15.
+	// PKCS1v15 is an older padding scheme but still widely used.
+	ciphertext, err := rsa.EncryptPKCS1v15(rand.Reader, rsaPubKey, message)
 	if err != nil {
 		return "", fmt.Errorf("error encrypting message: %w", err)
 	}
@@ -57,18 +52,35 @@ func encryptWithPublicKey(message []byte, publicKeyPEM string) (string, error) {
 }
 
 type LoginForm struct {
-	Username    string `json:"username"`
-	Password    string `json:"password"`
-	Captcha     string `json:"captcha"`
-	CurrentMenu string `json:"current_menu"`
-	FailN       string `json:"failN"`
-	MfaState    string `json:"mfaState"`
-	Execution   string `json:"execution"`
-	EventId     string `json:"_eventId"`
-	GeoLocation string `json:"geolocation"`
-	FpVisitorId string `json:"fpVisitorId"`
-	TrustAgent  string `json:"trustAgent"`
-	Submit1     string `json:"submit1"`
+	Username    string
+	Password    string
+	Captcha     string
+	CurrentMenu string
+	FailN       string
+	MfaState    string
+	Execution   string
+	EventId     string
+	GeoLocation string
+	FpVisitorId string
+	TrustAgent  string
+	Submit1     string
+}
+
+func (f *LoginForm) Encode() []byte {
+	ans := ""
+	ans += "username=" + url.QueryEscape(f.Username) + "&"
+	ans += "password=" + url.QueryEscape(f.Password) + "&"
+	ans += "captcha=" + url.QueryEscape(f.Captcha) + "&"
+	ans += "currentMenu=" + url.QueryEscape(f.CurrentMenu) + "&"
+	ans += "failN=" + url.QueryEscape(f.FailN) + "&"
+	ans += "mfaState=" + url.QueryEscape(f.MfaState) + "&"
+	ans += "execution=" + url.QueryEscape(f.Execution) + "&"
+	ans += "_eventId=" + url.QueryEscape(f.EventId) + "&"
+	ans += "geolocation=" + url.QueryEscape(f.GeoLocation) + "&"
+	ans += "fpVisitorId=" + url.QueryEscape(f.FpVisitorId) + "&"
+	ans += "trustAgent=" + url.QueryEscape(f.TrustAgent) + "&"
+	ans += "submit1=" + url.QueryEscape(f.Submit1)
+	return []byte(ans)
 }
 
 func NewLoginForm(username, password, execution, visitor_id string) *LoginForm {
@@ -125,6 +137,7 @@ const (
 	RequestError LoginError = iota
 	ApiError
 	NoIdentity
+	UnknownError
 )
 
 func (t LoginError) Error() string {
@@ -135,6 +148,8 @@ func (t LoginError) Error() string {
 		return "LoginError:ApiError"
 	case NoIdentity:
 		return "LoginError:NoIdentity"
+	case UnknownError:
+		return "LoginError:UnknownError"
 	}
 	panic("error not registered")
 }
@@ -154,7 +169,7 @@ func (t *XjtuLogin) request(req *http.Request, content_type ContentType) (*http.
 		return nil, err
 	}
 
-	if res.StatusCode != 200 {
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusFound {
 		return nil, RequestError
 	}
 	return res, nil
@@ -189,9 +204,6 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	if err != nil {
 		return "", err
 	}
-	if err != nil {
-		return "", err
-	}
 	login_page_req, err := http.NewRequest(http.MethodGet, login_url, nil)
 	if err != nil {
 		return "", err
@@ -213,38 +225,43 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	rand.Read(buf[:])
 	visitor_id := hex.EncodeToString(buf[:])
 	login_form := NewLoginForm(username, ciphertext, execution, visitor_id)
-	json_form, err := json.Marshal(*login_form)
+	req, err := http.NewRequest(http.MethodPost, post_login_url.String(), strings.NewReader(string(login_form.Encode())))
 	if err != nil {
 		return "", err
 	}
-	form_data := make(map[string]string)
-	err = json.Unmarshal(json_form, &form_data)
-	if err != nil {
-		return "", err
+	t.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.Response.StatusCode != http.StatusFound {
+			return nil
+		}
+		location, err := req.Response.Location()
+		// 302 should have a location
+		if err != nil {
+			return err
+		}
+		if strings.Contains(location.String(), "org.xjtu.edu.cn") || strings.Contains(location.String(), "login.xjtu.edu.cn") {
+			return nil
+		}
+		return http.ErrUseLastResponse
 	}
-	url_form_data := make(url.Values)
-	for k, v := range form_data {
-		url_form_data.Set(k, v)
-	}
-	req, err := http.NewRequest(http.MethodPost, post_login_url.String(), strings.NewReader(url_form_data.Encode()))
-	if err != nil {
-		return "", err
-	}
+
 	final_resp, err := t.request(req, Form)
 	if err != nil {
 		return "", err
 	}
-
-	s, err := io.ReadAll(final_resp.Body)
+	if final_resp.StatusCode == http.StatusUnauthorized {
+		return "", ApiError
+	}
+	if final_resp.StatusCode != http.StatusFound {
+		return "", UnknownError
+	}
+	redir, err := final_resp.Location()
 	if err != nil {
 		return "", err
 	}
-
-	fmt.Println(string(s))
-	return "hello world", nil
+	return redir.String(), nil
 }
 
 func Login(login_url, username, password string) (redir_url string, err error) {
-	session := new(true)
+	session := new(false)
 	return session.login(login_url, username, password)
 }
