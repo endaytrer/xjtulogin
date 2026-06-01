@@ -14,7 +14,7 @@ func TestLogin(t *testing.T) {
 	if !success {
 		t.Fatal("XJTU_PASSWORD not set")
 	}
-	redir_url, err := Login("http://gmis.xjtu.edu.cn/pyxx/sso/login", username, password)
+	redir_url, err := Login("https://lms.xjtu.edu.cn/", username, password)
 	if err != nil {
 		t.Fatalf("Login failed: %v", err)
 	}

@@ -6,7 +6,9 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -83,14 +85,14 @@ func (f *LoginForm) Encode() []byte {
 	return []byte(ans)
 }
 
-func NewLoginForm(username, password, execution, visitor_id string) *LoginForm {
+func NewLoginForm(username, password, mfa_state, execution, visitor_id string) *LoginForm {
 	return &LoginForm{
 		Username:    username,
 		Password:    fmt.Sprintf("__RSA__%s", password),
 		Captcha:     "",
 		CurrentMenu: "1",
 		FailN:       "0",
-		MfaState:    "",
+		MfaState:    mfa_state,
 		Execution:   execution,
 		EventId:     "submit",
 		GeoLocation: "",
@@ -98,6 +100,54 @@ func NewLoginForm(username, password, execution, visitor_id string) *LoginForm {
 		TrustAgent:  "",
 		Submit1:     "Login1",
 	}
+}
+
+type MfaStateRequestForm struct {
+	LoginType   string
+	Username    string
+	Password    string
+	fpVisitorId string
+}
+
+func (f *MfaStateRequestForm) Encode() []byte {
+	ans := ""
+	ans += "loginType=" + url.QueryEscape(f.LoginType) + "&"
+	ans += "username=" + url.QueryEscape(f.Username) + "&"
+	ans += "password=" + url.QueryEscape(f.Password) + "&"
+	ans += "fpVisitorId=" + url.QueryEscape(f.fpVisitorId)
+	return []byte(ans)
+}
+
+func NewMfaStateRequestForm(username, password, visitor_id string) *MfaStateRequestForm {
+	return &MfaStateRequestForm{
+		LoginType:   "passwordLogin",
+		Username:    username,
+		Password:    fmt.Sprintf("__RSA__%s", password),
+		fpVisitorId: visitor_id,
+	}
+}
+
+var ErrMfaRequired = errors.New("xjtulogin: mfa required")
+
+type MfaStateResponse struct {
+	MfaFederatedLoginEnabled bool   `json:"mfaFederatedLoginEnabled"`
+	MfaQrCodeLoginEnabled    bool   `json:"mfaQrCodeLoginEnabled"`
+	Need                     bool   `json:"need"`
+	MfaSmsCodeLoginEnabled   bool   `json:"mfaSmsCodeLoginEnabled"`
+	MfaTypeAppPush           bool   `json:"mfaTypeAppPush"`
+	MfaTypeBasicInfo         bool   `json:"mfaTypeBasicInfo"`
+	MfaTypeSecureEmail       bool   `json:"mfaTypeSecureEmail"`
+	MfaTypeSecurePhone       bool   `json:"mfaTypeSecurePhone"`
+	MfaTypeQrCode            bool   `json:"mfaTypeQrCode"`
+	MfaTypeOtp               bool   `json:"mfaTypeOtp"`
+	MfaTypeFaceVerify        bool   `json:"mfaTypeFaceVerify"`
+	MfaEnabled               bool   `json:"mfaEnabled"`
+	State                    string `json:"state"`
+}
+
+type MfaStateDetectResponse struct {
+	Code int              `json:"code"`
+	Data MfaStateResponse `json:"data"`
 }
 
 type XjtuLogin struct {
@@ -137,6 +187,8 @@ const (
 	RequestError LoginError = iota
 	ApiError
 	NoIdentity
+	RedirectionFailure
+	MaxAttemptsExceeded
 	UnknownError
 )
 
@@ -148,6 +200,10 @@ func (t LoginError) Error() string {
 		return "LoginError:ApiError"
 	case NoIdentity:
 		return "LoginError:NoIdentity"
+	case RedirectionFailure:
+		return "LoginError:RedirectionFailure"
+	case MaxAttemptsExceeded:
+		return "LoginError:MaxAttemptsExceeded"
 	case UnknownError:
 		return "LoginError:UnknownError"
 	}
@@ -185,6 +241,7 @@ func getAttribute(node *html.Node, key string) string {
 }
 
 const PUBKEY_URL = "https://login.xjtu.edu.cn/cas/jwt/publicKey"
+const MFA_STATE_URL = "https://login.xjtu.edu.cn/cas/mfa/detect"
 
 var selector_execution = cascadia.MustCompile("#fm1>input[name=\"execution\"]")
 
@@ -195,6 +252,7 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	if err != nil {
 		return "", err
 	}
+	defer pubkey_resp.Body.Close()
 	pubkey, err := io.ReadAll(pubkey_resp.Body)
 	if err != nil {
 		return "", err
@@ -208,12 +266,13 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	if err != nil {
 		return "", err
 	}
-	login_page_resp, err := t.request(login_page_req, None)
+	_ = login_page_req // keep request construction (and validation) but use lenient fetch
+	post_login_url, login_page_body, err := t.getLoginPageLenient(login_url)
 	if err != nil {
 		return "", err
 	}
-	post_login_url := login_page_resp.Request.URL
-	login_page, err := html.Parse(login_page_resp.Body)
+	defer login_page_body.Close()
+	login_page, err := html.Parse(login_page_body)
 	if err != nil {
 		return "", err
 	}
@@ -224,7 +283,34 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	var buf [16]byte
 	rand.Read(buf[:])
 	visitor_id := hex.EncodeToString(buf[:])
-	login_form := NewLoginForm(username, ciphertext, execution, visitor_id)
+
+	// request for mfa state
+	mfa_state_req_form := NewMfaStateRequestForm(username, ciphertext, visitor_id)
+	mfa_state_req, err := http.NewRequest(http.MethodPost, MFA_STATE_URL, strings.NewReader(string(mfa_state_req_form.Encode())))
+	if err != nil {
+		return "", err
+	}
+	mfa_state_resp, err := t.request(mfa_state_req, Form)
+	if err != nil {
+		return "", err
+	}
+	defer mfa_state_resp.Body.Close()
+	mfa_state_body, err := io.ReadAll(mfa_state_resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var mfa_state_detect MfaStateDetectResponse
+	if err := json.Unmarshal(mfa_state_body, &mfa_state_detect); err != nil {
+		return "", err
+	}
+	if mfa_state_detect.Code != 0 {
+		return "", ApiError
+	}
+	if mfa_state_detect.Data.Need {
+		return "", ErrMfaRequired
+	}
+
+	login_form := NewLoginForm(username, ciphertext, mfa_state_detect.Data.State, execution, visitor_id)
 	req, err := http.NewRequest(http.MethodPost, post_login_url.String(), strings.NewReader(string(login_form.Encode())))
 	if err != nil {
 		return "", err
@@ -238,7 +324,8 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 		if err != nil {
 			return err
 		}
-		if strings.Contains(location.String(), "org.xjtu.edu.cn") || strings.Contains(location.String(), "login.xjtu.edu.cn") {
+		host := location.Host
+		if host == "org.xjtu.edu.cn" || host == "login.xjtu.edu.cn" || host == "identity1.xjtu.edu.cn" {
 			return nil
 		}
 		return http.ErrUseLastResponse
@@ -252,7 +339,7 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 		return "", ApiError
 	}
 	if final_resp.StatusCode != http.StatusFound {
-		return "", UnknownError
+		return "", RedirectionFailure
 	}
 	redir, err := final_resp.Location()
 	if err != nil {
@@ -262,6 +349,17 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 }
 
 func Login(login_url, username, password string) (redir_url string, err error) {
-	session := new(false)
-	return session.login(login_url, username, password)
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		session := new(false)
+		redirURL, loginErr := session.login(login_url, username, password)
+		if loginErr == nil {
+			return redirURL, nil
+		}
+		if errors.Is(loginErr, RedirectionFailure) {
+			continue
+		}
+		return "", loginErr
+	}
+	return "", MaxAttemptsExceeded
 }
