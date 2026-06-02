@@ -306,9 +306,9 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	if mfa_state_detect.Code != 0 {
 		return "", ApiError
 	}
-	if mfa_state_detect.Data.Need {
-		return "", ErrMfaRequired
-	}
+	// if mfa_state_detect.Data.Need {
+	// 	return "", ErrMfaRequired
+	// }
 
 	login_form := NewLoginForm(username, ciphertext, mfa_state_detect.Data.State, execution, visitor_id)
 	req, err := http.NewRequest(http.MethodPost, post_login_url.String(), strings.NewReader(string(login_form.Encode())))
