@@ -550,3 +550,26 @@ func Login(login_url, username, password string, mfa_handler func(phone string, 
 	}
 	return "", MaxAttemptsExceeded
 }
+
+func LoginNoninteractive(login_url, username, password string) (redir_url string, err error) {
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		session := new(false)
+		redirURL, loginErr := session.login(login_url, username, password)
+
+		if loginErr == nil {
+			return redirURL, nil
+		}
+
+		switch e := loginErr.(type) {
+		case XjtuLoginMfaRequired:
+			return "", ErrMfaRequired
+		case LoginError:
+			if e == RedirectionFailure {
+				continue
+			}
+		}
+		return "", loginErr
+	}
+	return "", MaxAttemptsExceeded
+}
