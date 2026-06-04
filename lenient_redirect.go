@@ -60,7 +60,8 @@ func parseRedirectLocationFromReader(r *bufio.Reader) (statusCode int, location 
 //
 // This is useful when the peer sends invalid header field names that make Go's
 // net/http client fail with errors like:
-//   "net/http: HTTP/1.x transport connection broken: malformed MIME header line: SELINUX=Server:"
+//
+//	"net/http: HTTP/1.x transport connection broken: malformed MIME header line: SELINUX=Server:"
 func GetRedirectLocationRaw(rawURL string, userAgent string) (locationURL string, statusCode int, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {

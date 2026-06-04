@@ -85,7 +85,14 @@ func (f *LoginForm) Encode() []byte {
 	return []byte(ans)
 }
 
-func NewLoginForm(username, password, mfa_state, execution, visitor_id string) *LoginForm {
+func NewLoginForm(username, password, mfa_state, execution, visitor_id string, trust_agent bool) *LoginForm {
+	var trust_agent_str string
+	if trust_agent {
+		trust_agent_str = "true"
+	} else {
+		trust_agent_str = ""
+	}
+
 	return &LoginForm{
 		Username:    username,
 		Password:    fmt.Sprintf("__RSA__%s", password),
@@ -97,7 +104,7 @@ func NewLoginForm(username, password, mfa_state, execution, visitor_id string) *
 		EventId:     "submit",
 		GeoLocation: "",
 		FpVisitorId: visitor_id,
-		TrustAgent:  "",
+		TrustAgent:  trust_agent_str,
 		Submit1:     "Login1",
 	}
 }
@@ -145,14 +152,89 @@ type MfaStateResponse struct {
 	State                    string `json:"state"`
 }
 
-type MfaStateDetectResponse struct {
-	Code int              `json:"code"`
-	Data MfaStateResponse `json:"data"`
+type SecurePhoneResponse struct {
+	Gid             string `json:"gid"`
+	SecurePhone     string `json:"securePhone"`
+	AttestServerUrl string `json:"attestServerUrl"`
+}
+
+type MfaResponse[T any] struct {
+	Code int `json:"code"`
+	Data T   `json:"data"`
+}
+
+type OtpResponse struct {
+	Result string `json:"result"`
+}
+type OtpValidateResponse struct {
+	Result string `json:"result"`
+	Status int    `json:"status"`
+}
+
+type OtpRequest struct {
+	Gid string `json:"gid"`
+}
+type OtpValidateRequest struct {
+	Code string `json:"code"`
+	Gid  string `json:"gid"`
 }
 
 type XjtuLogin struct {
 	client  http.Client
 	headers http.Header
+}
+
+func (t *XjtuLogin) Client() *http.Client {
+	return &t.client
+}
+func (t *XjtuLogin) Headers() http.Header {
+	return t.headers
+}
+
+type XjtuLoginOtpRequired struct {
+	client       http.Client
+	headers      http.Header
+	postLoginUrl url.URL
+	username     string
+	password     string
+	mfaState     string
+	execution    string
+	visitorId    string
+	gid          string
+	phoneNo      string
+}
+
+func (t *XjtuLoginOtpRequired) Client() *http.Client {
+	return &t.client
+}
+func (t *XjtuLoginOtpRequired) Headers() http.Header {
+	return t.headers
+}
+
+type RequestSender interface {
+	Client() *http.Client
+	Headers() http.Header
+}
+
+func Request(t RequestSender, req *http.Request, content_type ContentType) (*http.Response, error) {
+	req.Header = make(http.Header)
+	for k, v := range t.Headers() {
+		req.Header[k] = v
+	}
+	if content_type != None {
+		req.Header.Add("Content-Type", string(content_type))
+	}
+
+	res, err := t.Client().Do(req)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusFound {
+		return nil, RequestError
+	}
+	return res, nil
 }
 
 func new(mobile bool) XjtuLogin {
@@ -211,24 +293,14 @@ func (t LoginError) Error() string {
 }
 
 func (t *XjtuLogin) request(req *http.Request, content_type ContentType) (*http.Response, error) {
-	req.Header = make(http.Header)
-	for k, v := range t.headers {
-		req.Header[k] = v
-	}
-	if content_type != None {
-		req.Header.Add("Content-Type", string(content_type))
-	}
+	return Request(t, req, content_type)
+}
+func (t *XjtuLoginOtpRequired) request(req *http.Request, content_type ContentType) (*http.Response, error) {
+	return Request(t, req, content_type)
+}
 
-	res, err := t.client.Do(req)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusFound {
-		return nil, RequestError
-	}
-	return res, nil
+func (t XjtuLoginOtpRequired) Error() string {
+	return fmt.Sprintf("xjtulogin: otp required, gid=%s", t.gid)
 }
 
 func getAttribute(node *html.Node, key string) string {
@@ -242,6 +314,9 @@ func getAttribute(node *html.Node, key string) string {
 
 const PUBKEY_URL = "https://login.xjtu.edu.cn/cas/jwt/publicKey"
 const MFA_STATE_URL = "https://login.xjtu.edu.cn/cas/mfa/detect"
+const MFA_PHONE_URL = "https://login.xjtu.edu.cn/cas/mfa/initByType/securephone"
+const MFA_OTP_URL = "https://login.xjtu.edu.cn/attest/api/guard/securephone/send"
+const MFA_OTP_VALIDATE_URL = "https://login.xjtu.edu.cn/attest/api/guard/securephone/valid"
 
 var selector_execution = cascadia.MustCompile("#fm1>input[name=\"execution\"]")
 
@@ -299,7 +374,7 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	if err != nil {
 		return "", err
 	}
-	var mfa_state_detect MfaStateDetectResponse
+	var mfa_state_detect MfaResponse[MfaStateResponse]
 	if err := json.Unmarshal(mfa_state_body, &mfa_state_detect); err != nil {
 		return "", err
 	}
@@ -307,15 +382,109 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 		return "", ApiError
 	}
 	if mfa_state_detect.Data.Need {
-		return "", ErrMfaRequired
+		// 1. GET /cas/mfa/initByType/securephone with state from mfa_state_detect
+		mfa_phone_req, err := http.NewRequest(http.MethodGet, MFA_PHONE_URL+"?state="+mfa_state_detect.Data.State, nil)
+		if err != nil {
+			return "", err
+		}
+		mfa_phone_resp, err := t.request(mfa_phone_req, None)
+		if err != nil {
+			return "", err
+		}
+		defer mfa_phone_resp.Body.Close()
+		mfa_phone_body, err := io.ReadAll(mfa_phone_resp.Body)
+		if err != nil {
+			return "", err
+		}
+		var mfa_phone_info MfaResponse[SecurePhoneResponse]
+		if err := json.Unmarshal(mfa_phone_body, &mfa_phone_info); err != nil {
+			return "", err
+		}
+		return "", XjtuLoginOtpRequired{
+			client:       t.client,
+			headers:      t.headers,
+			postLoginUrl: *post_login_url,
+			username:     username,
+			password:     ciphertext,
+			mfaState:     mfa_state_detect.Data.State,
+			execution:    execution,
+			visitorId:    visitor_id,
+			gid:          mfa_phone_info.Data.Gid,
+			phoneNo:      mfa_phone_info.Data.SecurePhone,
+		}
 	}
+	return loginAttempt(t, *post_login_url, username, ciphertext, mfa_state_detect.Data.State, execution, visitor_id, false)
+}
 
-	login_form := NewLoginForm(username, ciphertext, mfa_state_detect.Data.State, execution, visitor_id)
-	req, err := http.NewRequest(http.MethodPost, post_login_url.String(), strings.NewReader(string(login_form.Encode())))
+func (t *XjtuLoginOtpRequired) SendOtp() error {
+	otp_req_json, err := json.Marshal(OtpRequest{Gid: t.gid})
+	if err != nil {
+		return err
+	}
+	otp_req, err := http.NewRequest(http.MethodPost, MFA_OTP_URL, strings.NewReader(string(otp_req_json)))
+	if err != nil {
+		return err
+	}
+	otp_resp, err := t.request(otp_req, Json)
+	if err != nil {
+		return err
+	}
+	defer otp_resp.Body.Close()
+	otp_resp_body, err := io.ReadAll(otp_resp.Body)
+	if err != nil {
+		return err
+	}
+	var otp_response MfaResponse[OtpResponse]
+	if err := json.Unmarshal(otp_resp_body, &otp_response); err != nil {
+		return err
+	}
+	if otp_response.Code != 0 {
+		return ApiError
+	}
+	if otp_response.Data.Result != "ok" {
+		return ApiError
+	}
+	return nil
+}
+func (t *XjtuLoginOtpRequired) LoginWithOtp(otp string, trust_agent bool) (redir_url string, err error) {
+	// 1. validate otp
+	otp_validate_req_json, err := json.Marshal(OtpValidateRequest{Code: otp, Gid: t.gid})
 	if err != nil {
 		return "", err
 	}
-	t.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	otp_validate_req, err := http.NewRequest(http.MethodPost, MFA_OTP_VALIDATE_URL, strings.NewReader(string(otp_validate_req_json)))
+	if err != nil {
+		return "", err
+	}
+	otp_validate_resp, err := t.request(otp_validate_req, Json)
+	if err != nil {
+		return "", err
+	}
+	defer otp_validate_resp.Body.Close()
+	otp_validate_resp_body, err := io.ReadAll(otp_validate_resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var otp_validate_response MfaResponse[OtpValidateResponse]
+	if err := json.Unmarshal(otp_validate_resp_body, &otp_validate_response); err != nil {
+		return "", err
+	}
+	if otp_validate_response.Code != 0 {
+		return "", ApiError
+	}
+	if otp_validate_response.Data.Result != "ok" {
+		return "", ApiError
+	}
+	return loginAttempt(t, t.postLoginUrl, t.username, t.password, t.mfaState, t.execution, t.visitorId, trust_agent)
+}
+
+func loginAttempt(t RequestSender, login_url url.URL, username, password, mfa_state, execution, visitor_id string, trust_agent bool) (redir_url string, err error) {
+	login_form := NewLoginForm(username, password, mfa_state, execution, visitor_id, trust_agent)
+	req, err := http.NewRequest(http.MethodPost, login_url.String(), strings.NewReader(string(login_form.Encode())))
+	if err != nil {
+		return "", err
+	}
+	t.Client().CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if req.Response.StatusCode != http.StatusFound {
 			return nil
 		}
@@ -331,7 +500,7 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 		return http.ErrUseLastResponse
 	}
 
-	final_resp, err := t.request(req, Form)
+	final_resp, err := Request(t, req, Form)
 	if err != nil {
 		return "", err
 	}
@@ -348,16 +517,28 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	return redir.String(), nil
 }
 
-func Login(login_url, username, password string) (redir_url string, err error) {
+func Login(login_url, username, password string, otp_handler func(phone string, send_otp func() error) (otp string, trust_device bool, err error)) (redir_url string, err error) {
 	const maxAttempts = 8
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		session := new(false)
 		redirURL, loginErr := session.login(login_url, username, password)
+
 		if loginErr == nil {
 			return redirURL, nil
 		}
-		if errors.Is(loginErr, RedirectionFailure) {
-			continue
+
+		switch e := loginErr.(type) {
+		case XjtuLoginOtpRequired:
+			otp, trust_device, err := otp_handler(e.phoneNo, e.SendOtp)
+			if err != nil {
+				return "", err
+			}
+			redirURL, loginErr = e.LoginWithOtp(otp, trust_device)
+
+		case LoginError:
+			if e == RedirectionFailure {
+				continue
+			}
 		}
 		return "", loginErr
 	}
