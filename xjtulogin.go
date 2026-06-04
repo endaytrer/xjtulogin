@@ -191,7 +191,7 @@ func (t *XjtuLogin) Headers() http.Header {
 	return t.headers
 }
 
-type XjtuLoginOtpRequired struct {
+type XjtuLoginMfaRequired struct {
 	client       http.Client
 	headers      http.Header
 	postLoginUrl url.URL
@@ -204,10 +204,10 @@ type XjtuLoginOtpRequired struct {
 	phoneNo      string
 }
 
-func (t *XjtuLoginOtpRequired) Client() *http.Client {
+func (t *XjtuLoginMfaRequired) Client() *http.Client {
 	return &t.client
 }
-func (t *XjtuLoginOtpRequired) Headers() http.Header {
+func (t *XjtuLoginMfaRequired) Headers() http.Header {
 	return t.headers
 }
 
@@ -295,11 +295,11 @@ func (t LoginError) Error() string {
 func (t *XjtuLogin) request(req *http.Request, content_type ContentType) (*http.Response, error) {
 	return Request(t, req, content_type)
 }
-func (t *XjtuLoginOtpRequired) request(req *http.Request, content_type ContentType) (*http.Response, error) {
+func (t *XjtuLoginMfaRequired) request(req *http.Request, content_type ContentType) (*http.Response, error) {
 	return Request(t, req, content_type)
 }
 
-func (t XjtuLoginOtpRequired) Error() string {
+func (t XjtuLoginMfaRequired) Error() string {
 	return fmt.Sprintf("xjtulogin: otp required, gid=%s", t.gid)
 }
 
@@ -400,7 +400,7 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 		if err := json.Unmarshal(mfa_phone_body, &mfa_phone_info); err != nil {
 			return "", err
 		}
-		return "", XjtuLoginOtpRequired{
+		return "", XjtuLoginMfaRequired{
 			client:       t.client,
 			headers:      t.headers,
 			postLoginUrl: *post_login_url,
@@ -416,7 +416,7 @@ func (t *XjtuLogin) login(login_url, username, password string) (redir_url strin
 	return loginAttempt(t, *post_login_url, username, ciphertext, mfa_state_detect.Data.State, execution, visitor_id, false)
 }
 
-func (t *XjtuLoginOtpRequired) SendOtp() error {
+func (t *XjtuLoginMfaRequired) SendOtp() error {
 	otp_req_json, err := json.Marshal(OtpRequest{Gid: t.gid})
 	if err != nil {
 		return err
@@ -446,7 +446,7 @@ func (t *XjtuLoginOtpRequired) SendOtp() error {
 	}
 	return nil
 }
-func (t *XjtuLoginOtpRequired) LoginWithOtp(otp string, trust_agent bool) (redir_url string, err error) {
+func (t *XjtuLoginMfaRequired) LoginWithOtp(otp string, trust_agent bool) (redir_url string, err error) {
 	// 1. validate otp
 	otp_validate_req_json, err := json.Marshal(OtpValidateRequest{Code: otp, Gid: t.gid})
 	if err != nil {
@@ -517,7 +517,7 @@ func loginAttempt(t RequestSender, login_url url.URL, username, password, mfa_st
 	return redir.String(), nil
 }
 
-func Login(login_url, username, password string, otp_handler func(phone string, send_otp func() error) (otp string, trust_device bool, err error)) (redir_url string, err error) {
+func Login(login_url, username, password string, mfa_handler func(phone string, send_otp func() error) (otp string, trust_device bool, err error)) (redir_url string, err error) {
 	const maxAttempts = 8
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		session := new(false)
@@ -528,12 +528,18 @@ func Login(login_url, username, password string, otp_handler func(phone string, 
 		}
 
 		switch e := loginErr.(type) {
-		case XjtuLoginOtpRequired:
-			otp, trust_device, err := otp_handler(e.phoneNo, e.SendOtp)
+		case XjtuLoginMfaRequired:
+			otp, trust_device, err := mfa_handler(e.phoneNo, e.SendOtp)
 			if err != nil {
 				return "", err
 			}
 			redirURL, loginErr = e.LoginWithOtp(otp, trust_device)
+			if loginErr == nil {
+				return redirURL, nil
+			}
+			if errors.Is(loginErr, RedirectionFailure) {
+				continue
+			}
 
 		case LoginError:
 			if e == RedirectionFailure {
